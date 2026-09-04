@@ -5,6 +5,14 @@
 #include "dpt_risk.h"
 #include <android/api-level.h>
 #include <climits>
+#include <cerrno>
+#include <ctime>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <vector>
 #include "mbedtls/sha256.h"
 #include "mz_crypt.h"
 #include "dpt.h"
@@ -128,67 +136,254 @@ DPT_ENCRYPT NO_INLINE void verifyLibcTextCrc() {
     }
 }
 
+// ======================= hardened risk detection =======================
+// The checks below read /proc through raw syscalls (linux_syscall_support.h)
+// so they keep working even when attackers hook libc open/read/readdir to
+// fake /proc contents.
+
+// Read a whole file (size bounded) using raw syscalls only.
+DPT_ENCRYPT static std::vector<char> read_file_via_syscall(const char *path) {
+    std::vector<char> buf;
+    int fd = sys_open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        return buf;
+    }
+    char tmp[4096];
+    const size_t cap = 4 * 1024 * 1024;
+    for (;;) {
+        ssize_t n = sys_read(fd, tmp, sizeof(tmp));
+        if (n <= 0) {
+            break;
+        }
+        if (buf.size() + static_cast<size_t>(n) > cap) {
+            break;
+        }
+        buf.insert(buf.end(), tmp, tmp + n);
+    }
+    sys_close(fd);
+    buf.push_back('\0');
+    return buf;
+}
+
+// Parse "TracerPid:\tNNN" from a /proc/self/status buffer.
+DPT_ENCRYPT static int parse_tracer_pid(const char *status_buf) {
+    const char *tracer_key = AY_OBFUSCATE("TracerPid:");
+    const char *p = dpt_strstr(status_buf, tracer_key);
+    if (p == nullptr) {
+        return 0;
+    }
+    p += dpt_strlen(tracer_key);
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    int tracer_pid = 0;
+    while (*p >= '0' && *p <= '9') {
+        tracer_pid = tracer_pid * 10 + (*p - '0');
+        p++;
+    }
+    return tracer_pid;
+}
+
+// Cheap xorshift32 used to randomize the check schedule.
+static uint32_t g_rng_state = 0;
+
+DPT_ENCRYPT static uint32_t dpt_next_rand() {
+    if (g_rng_state == 0) {
+        struct timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        g_rng_state = static_cast<uint32_t>(ts.tv_nsec)
+                      ^ static_cast<uint32_t>(ts.tv_sec << 16)
+                      ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_rng_state));
+        if (g_rng_state == 0) {
+            g_rng_state = 0x9e3779b9u;
+        }
+    }
+    uint32_t x = g_rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_rng_state = x;
+    return x;
+}
+
+// frida-server / frida-gadget listen on 127.0.0.1:27042 by default.
+DPT_ENCRYPT static bool probe_frida_port(int port) {
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (s < 0) {
+        return false;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    bool connected = false;
+    int r = connect(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    if (r == 0) {
+        connected = true;
+    } else if (errno == EINPROGRESS) {
+        pollfd pfd{};
+        pfd.fd = s;
+        pfd.events = POLLOUT;
+        if (poll(&pfd, 1, 150) > 0) {
+            int soerr = 0;
+            socklen_t len = sizeof(soerr);
+            if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &len) == 0 && soerr == 0) {
+                connected = true;
+            }
+        }
+    }
+    close(s);
+    return connected;
+}
+
+// Single-stepping or emulator-level tracing inflates a trivial integer loop
+// by orders of magnitude. Require two consecutive anomalies so transient CPU
+// throttling does not kill legitimate users.
+DPT_ENCRYPT static void detectTimingAnomaly() {
+    static int consecutive = 0;
+    struct timespec t0{};
+    struct timespec t1{};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    volatile uint32_t acc = 0;
+    for (uint32_t i = 0; i < 200000u; i++) {
+        acc += i;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long elapsed_ns = static_cast<long>(t1.tv_sec - t0.tv_sec) * 1000000000L
+                      + static_cast<long>(t1.tv_nsec - t0.tv_nsec);
+    if (elapsed_ns > 300L * 1000L * 1000L) {
+        if (++consecutive >= 2) {
+            DLOGW("timing anomaly detected, elapsed=%ldms", elapsed_ns / 1000000L);
+            dpt_crash();
+        }
+    } else {
+        consecutive = 0;
+    }
+}
+
 DPT_ENCRYPT void detectFrida() {
     const char *frida_agent = AY_OBFUSCATE("frida-agent");
+    const char *frida_gadget = AY_OBFUSCATE("frida-gadget");
+    const char *frida_server = AY_OBFUSCATE("frida-server");
+    const char *linjector = AY_OBFUSCATE("linjector");
     const char *pool_frida = AY_OBFUSCATE("pool-frida");
     const char *gmain = AY_OBFUSCATE("gmain");
     const char *gbus = AY_OBFUSCATE("gdbus");
     const char *gum_js_loop = AY_OBFUSCATE("gum-js-loop");
 
-    int frida_so_count = find_in_maps(1, frida_agent);
-    if (frida_so_count > 0) {
+    // maps scan through raw syscalls (immune to libc open/read hooks)
+    const char *maps_path = AY_OBFUSCATE("/proc/self/maps");
+    std::vector<char> maps = read_file_via_syscall(maps_path);
+    if (!maps.empty()) {
+        const char *so_patterns[] = {frida_agent, frida_gadget, frida_server, linjector};
+        for (const char *pattern : so_patterns) {
+            if (dpt_strstr(maps.data(), pattern) != nullptr) {
+                DLOGD("found frida pattern in maps");
+                dpt_crash();
+            }
+        }
+    } else if (find_in_maps(1, frida_agent) > 0) {
         DLOGD("found frida so");
         dpt_crash();
     }
-    int frida_thread_count = find_in_threads_list(4
-            , pool_frida
-            , gmain
-            , gbus
-            , gum_js_loop);
 
-    if (frida_thread_count >= 2) {
+    // frida-specific thread names must never appear in a clean process
+    if (find_in_threads_list(2, pool_frida, gum_js_loop) > 0) {
+        DLOGD("found frida-specific thread");
+        dpt_crash();
+    }
+    if (find_in_threads_list(4, pool_frida, gmain, gbus, gum_js_loop) >= 2) {
         DLOGD("found frida threads");
+        dpt_crash();
+    }
+
+    // default frida listening port
+    if (probe_frida_port(27042)) {
+        DLOGD("frida listening port detected");
         dpt_crash();
     }
 }
 
 DPT_ENCRYPT void detectDebugger() {
+    // Primary path: read /proc/self/status via raw syscalls and parse it by
+    // hand, so hooked libc open/read/sscanf cannot hide a tracer.
     const char *status_path = AY_OBFUSCATE("/proc/self/status");
-    FILE *fp = fopen(status_path, "r");
-    if (fp == nullptr) {
-        DLOGW("cannot open /proc/self/status, skip tracer pid check");
-        return;
-    }
-
-    const char *tracer_key = AY_OBFUSCATE("TracerPid:");
-    char line[256];
-    while (fgets(line, sizeof(line), fp) != nullptr) {
-        if (strncmp(line, tracer_key, strlen(tracer_key)) == 0) {
-            int tracer_pid = 0;
-            sscanf(line + strlen(tracer_key), "%d", &tracer_pid);
-            if (tracer_pid != 0) {
-                DLOGD("found tracer pid: %d", tracer_pid);
-                fclose(fp);
-                dpt_crash();
+    std::vector<char> status = read_file_via_syscall(status_path);
+    if (!status.empty()) {
+        int tracer_pid = parse_tracer_pid(status.data());
+        if (tracer_pid != 0) {
+            DLOGD("found tracer pid: %d", tracer_pid);
+            dpt_crash();
+        }
+    } else {
+        // Fallback to the stdio based check when raw syscalls are unavailable.
+        FILE *fp = fopen(status_path, "r");
+        if (fp != nullptr) {
+            const char *tracer_key = AY_OBFUSCATE("TracerPid:");
+            char line[256];
+            while (fgets(line, sizeof(line), fp) != nullptr) {
+                if (strncmp(line, tracer_key, strlen(tracer_key)) == 0) {
+                    int tracer_pid = 0;
+                    sscanf(line + strlen(tracer_key), "%d", &tracer_pid);
+                    if (tracer_pid != 0) {
+                        DLOGD("found tracer pid: %d", tracer_pid);
+                        fclose(fp);
+                        dpt_crash();
+                    }
+                    break;
+                }
             }
-            break;
+            fclose(fp);
         }
     }
-    fclose(fp);
+
+    // Cross-check: a release process must never host a JDWP thread.
+    const char *jdwp_name = AY_OBFUSCATE("JDWP");
+    if (find_in_threads_list(1, jdwp_name) > 0) {
+        DLOGD("found JDWP thread");
+        dpt_crash();
+    }
 }
 
 [[noreturn]] DPT_ENCRYPT void *detectRiskOnThread(__unused void *args) {
+    uint32_t round = 0;
     while (true) {
-        if ((g_shell_config.risk_check_flags & FLAG_DISABLE_FRIDA_DETECT) == 0) {
-            detectFrida();
+        bool run[4];
+        run[0] = (g_shell_config.risk_check_flags & FLAG_DISABLE_FRIDA_DETECT) == 0;
+        run[1] = (g_shell_config.risk_check_flags & FLAG_DISABLE_CRC_DETECT) == 0;
+        run[2] = (g_shell_config.risk_check_flags & FLAG_DISABLE_ANTI_DEBUG) == 0;
+        run[3] = run[2]; // timing check rides on the anti-debug flag
+
+        // Rotate the check order every round so the schedule is not a fixed,
+        // easy-to-anticipate sequence.
+        for (uint32_t i = 0; i < 4; i++) {
+            uint32_t idx = (round + i) & 3u;
+            if (!run[idx]) {
+                continue;
+            }
+            switch (idx) {
+                case 0:
+                    detectFrida();
+                    break;
+                case 1:
+                    verifyLibcTextCrc();
+                    break;
+                case 2:
+                    detectDebugger();
+                    break;
+                case 3:
+                    detectTimingAnomaly();
+                    break;
+                default:
+                    break;
+            }
         }
-        if ((g_shell_config.risk_check_flags & FLAG_DISABLE_CRC_DETECT) == 0) {
-            verifyLibcTextCrc();
-        }
-        if ((g_shell_config.risk_check_flags & FLAG_DISABLE_ANTI_DEBUG) == 0) {
-            detectDebugger();
-        }
-        sleep(10);
+        round++;
+
+        // Randomized interval in [3, 9) seconds instead of a fixed 10s window.
+        uint32_t delay = 3 + dpt_next_rand() % 6;
+        sleep(delay);
     }
 }
 
