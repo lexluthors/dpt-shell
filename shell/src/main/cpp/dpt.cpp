@@ -24,19 +24,6 @@ KEEP_SYMBOL DPT_DATA_SECTION uint8_t DPT_UNKNOWN_DATA[] = "1234567890abcdef";
 
 ShellConfig g_shell_config;
 
-static JNINativeMethod gMethods[] = {
-        {"craoc", "(Ljava/lang/String;)V",                               (void *) callRealApplicationOnCreate},
-        {"ia",    "()V", (void *) init_app},
-        {"gap",   "()Ljava/lang/String;",         (void *) getSourceDirExport},
-        {"gdp",   "()Ljava/lang/String;",         (void *) getCompressedDexesPathExport},
-        {"rcf",   "()Ljava/lang/String;",         (void *) readAppComponentFactory},
-        {"rapn",   "()Ljava/lang/String;",        (void *) readApplicationName},
-        {"cbde",   "(Ljava/lang/ClassLoader;)V",  (void *) combineDexElements},
-        {"rde",   "(Ljava/lang/ClassLoader;Ljava/lang/String;)V",        (void *) removeDexElements},
-        {"ra", "(Ljava/lang/String;)Ljava/lang/Object;",                               (void *) replaceApplication},
-        {"clinit", "()V",                               (void *) clinit}
-};
-
 DPT_ENCRYPT jobjectArray makePathElements(JNIEnv* env,const char *pathChs) {
     jstring path = env->NewStringUTF(pathChs);
     java_io_File file(env,path);
@@ -397,12 +384,29 @@ DPT_ENCRYPT jobject replaceApplicationOnLoadedApk(JNIEnv *env, jclass __unused, 
 }
 
 
+// JNINativeMethod entry with compile-time obfuscated name and signature.
+#define DPT_JNI_METHOD(name, signature, fnPtr) \
+        { AY_OBFUSCATE(name), AY_OBFUSCATE(signature), (void *) (fnPtr) }
+
 DPT_ENCRYPT static bool registerNativeMethods(JNIEnv *env) {
+    JNINativeMethod methods[] = {
+            DPT_JNI_METHOD("craoc", "(Ljava/lang/String;)V", callRealApplicationOnCreate),
+            DPT_JNI_METHOD("ia", "()V", init_app),
+            DPT_JNI_METHOD("gap", "()Ljava/lang/String;", getSourceDirExport),
+            DPT_JNI_METHOD("gdp", "()Ljava/lang/String;", getCompressedDexesPathExport),
+            DPT_JNI_METHOD("rcf", "()Ljava/lang/String;", readAppComponentFactory),
+            DPT_JNI_METHOD("rapn", "()Ljava/lang/String;", readApplicationName),
+            DPT_JNI_METHOD("cbde", "(Ljava/lang/ClassLoader;)V", combineDexElements),
+            DPT_JNI_METHOD("rde", "(Ljava/lang/ClassLoader;Ljava/lang/String;)V", removeDexElements),
+            DPT_JNI_METHOD("ra", "(Ljava/lang/String;)Ljava/lang/Object;", replaceApplication),
+            DPT_JNI_METHOD("clinit", "()V", clinit)
+    };
+
     jclass JniBridgeClass = env->FindClass(g_shell_config.jni_class_name.c_str());
     if(JniBridgeClass == nullptr) {
         DLOGF("cannot find class: %s!", g_shell_config.jni_class_name.c_str());
     }
-    if (env->RegisterNatives(JniBridgeClass, gMethods, sizeof(gMethods) / sizeof(gMethods[0])) ==
+    if (env->RegisterNatives(JniBridgeClass, methods, ARRAY_LENGTH(methods)) ==
         0) {
         return JNI_TRUE;
     }
@@ -559,6 +563,7 @@ DPT_ENCRYPT void read_shell_config(JNIEnv *env) {
                 const char *keyDexSign = AY_OBFUSCATE("dex_sign");
                 const char *keyJunkClsName = AY_OBFUSCATE("junk_cls_name");
                 const char *keyRiskCheckFlags = AY_OBFUSCATE("risk_check_flags");
+                const char *keyAppPkgName = AY_OBFUSCATE("app_pkg_name");
                 g_shell_config.application_name = shell_config.value(keyAppName, "");
                 g_shell_config.application_component_factory = shell_config.value(keyAcfName, "");
                 g_shell_config.jni_class_name = shell_config.value(keyJniClsName, "");
@@ -566,6 +571,7 @@ DPT_ENCRYPT void read_shell_config(JNIEnv *env) {
                 g_shell_config.dex_sign = shell_config.value(keyDexSign, "");
                 g_shell_config.junk_class_name = shell_config.value(keyJunkClsName, "");
                 g_shell_config.risk_check_flags = shell_config.value(keyRiskCheckFlags, 0);
+                g_shell_config.app_package_name = shell_config.value(keyAppPkgName, "");
 
                 DLOGD("application_name = %s", g_shell_config.application_name.c_str());
                 DLOGD("application_component_factory = %s", g_shell_config.application_component_factory.c_str());
@@ -574,6 +580,7 @@ DPT_ENCRYPT void read_shell_config(JNIEnv *env) {
                 DLOGD("dex_sign = %s", g_shell_config.dex_sign.c_str());
                 DLOGD("junk_class_name = %s", g_shell_config.junk_class_name.c_str());
                 DLOGD("risk_check_flags = 0x%x", g_shell_config.risk_check_flags);
+                DLOGD("app_package_name = %s", g_shell_config.app_package_name.c_str());
             } catch (const std::exception &e) {
                 DLOGE("parse shell config failed: %s", e.what());
             }

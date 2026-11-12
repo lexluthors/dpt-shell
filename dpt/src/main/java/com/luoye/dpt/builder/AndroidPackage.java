@@ -14,6 +14,7 @@ import com.luoye.dpt.model.MultiDexCode;
 import com.luoye.dpt.task.ThreadPool;
 import com.luoye.dpt.util.CryptoUtils;
 import com.luoye.dpt.util.DexUtils;
+import com.luoye.dpt.util.DexVersionUtils;
 import com.luoye.dpt.util.FileUtils;
 import com.luoye.dpt.util.HexUtils;
 import com.luoye.dpt.util.IoUtils;
@@ -378,6 +379,13 @@ public abstract class AndroidPackage {
     public void writeConfig(String packageDir, byte[] key) {
         File configFile = new File(getOutAssetsDir(packageDir).getAbsolutePath() + File.separator + Const.KEY_SHELL_CONFIG_STORE_NAME);
         ShellConfig shellConfig = ShellConfig.getInstance();
+        // 把应用包名一起下发给壳。壳在 app_process 进程里需要它来挑出正确的 APK：
+        // 那些进程的 java.class.path 指向 Shizuku 自己的 APK，直接取第一个 .apk
+        // 会算错签名证书。
+        //
+        // 故意不为它单独导出一个 .so 数据符号 —— 符号表里多一个语义直白的名字
+        // （SN_APP_PKG 之类）等于主动告诉分析者这里有什么。
+        shellConfig.setAppPackageName(getPackageName());
         String json = shellConfig.toJson();
         LogUtils.info("Write config: " + json);
         byte[] aesKey = deriveConfigAesKey(key);
@@ -671,7 +679,7 @@ public abstract class AndroidPackage {
                 || f.getAbsolutePath().endsWith(".aab");
     }
 
-    public void extractDexCode(String packageDir, String dexCodeSavePath, byte[] soKey) {
+    public void processDexFiles(String packageDir, String dexCodeSavePath, byte[] soKey) {
         List<File> dexFiles = getDexFiles(getDexDir(packageDir));
         Map<Integer,List<Instruction>> instructionMap = new HashMap<>();
         String appNameNew = Const.KEY_CODE_ITEM_STORE_NAME;
@@ -685,6 +693,8 @@ public abstract class AndroidPackage {
         shellConfig.setInsnsCryptKey(deriveConfigAesKey(soKey));
         for(File dexFile : dexFiles) {
             ThreadPool.getInstance().execute(() -> {
+
+                int dexVersion = DexVersionUtils.readDexVersion(dexFile);
                 final int dexNo = DexUtils.getDexNumber(dexFile.getName());
                 if(dexNo < 0) {
                     countDownLatch.countDown();
@@ -746,6 +756,8 @@ public abstract class AndroidPackage {
                     DexUtils.writeHashes(extractedDexFile, dexFileRightHashes);
                     dexFile.delete();
                     dexFileRightHashes.renameTo(dexFile);
+
+                    DexVersionUtils.writeDexVersion(dexFile, dexVersion);
                 }
                 catch (Exception e) {
                 }
