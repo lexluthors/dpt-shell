@@ -4,6 +4,7 @@
 
 #include "dpt_risk.h"
 #include <android/api-level.h>
+#include <atomic>
 #include <climits>
 #include <cerrno>
 #include <ctime>
@@ -185,25 +186,29 @@ DPT_ENCRYPT static int parse_tracer_pid(const char *status_buf) {
 }
 
 // Cheap xorshift32 used to randomize the check schedule.
-static uint32_t g_rng_state = 0;
+static std::atomic<uint32_t> g_rng_state{0};
 
 DPT_ENCRYPT static uint32_t dpt_next_rand() {
-    if (g_rng_state == 0) {
+    uint32_t state = g_rng_state.load(std::memory_order_relaxed);
+    if (state == 0) {
         struct timespec ts{};
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        g_rng_state = static_cast<uint32_t>(ts.tv_nsec)
-                      ^ static_cast<uint32_t>(ts.tv_sec << 16)
-                      ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_rng_state));
-        if (g_rng_state == 0) {
-            g_rng_state = 0x9e3779b9u;
+        state = static_cast<uint32_t>(ts.tv_nsec)
+                ^ static_cast<uint32_t>(ts.tv_sec << 16)
+                ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_rng_state));
+        if (state == 0) {
+            state = 0x9e3779b9u;
         }
     }
-    uint32_t x = g_rng_state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    g_rng_state = x;
-    return x;
+    for (;;) {
+        uint32_t x = state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        if (g_rng_state.compare_exchange_weak(state, x, std::memory_order_relaxed)) {
+            return x;
+        }
+    }
 }
 
 // frida-server / frida-gadget listen on 127.0.0.1:27042 by default.
@@ -387,9 +392,50 @@ DPT_ENCRYPT void detectDebugger() {
     }
 }
 
+// Fast risk detection thread: lightweight checks at short intervals (1-2s).
+// Closes the detection window that the 3-9s slow thread leaves open.
+// This runs in parallel with the original detectRiskOnThread().
+[[noreturn]] DPT_ENCRYPT void *detectRiskFast(__unused void *args) {
+    const char *pool_frida = AY_OBFUSCATE("pool-frida");
+    const char *gmain = AY_OBFUSCATE("gmain");
+    const char *gbus = AY_OBFUSCATE("gdbus");
+    const char *gum_js_loop = AY_OBFUSCATE("gum-js-loop");
+
+    while (true) {
+        // TracerPid + JDWP thread detection — fast, reads /proc/self/status
+        if ((g_shell_config.risk_check_flags & FLAG_DISABLE_ANTI_DEBUG) == 0) {
+            detectDebugger();
+        }
+
+        // Frida port probe + thread name scan — fast, 150ms timeout max
+        if ((g_shell_config.risk_check_flags & FLAG_DISABLE_FRIDA_DETECT) == 0) {
+            // frida-server / frida-gadget listen on 127.0.0.1:27042 by default
+            if (probe_frida_port(27042)) {
+                DLOGD("frida listening port detected");
+                dpt_crash();
+            }
+
+            // frida-specific thread names must never appear in a clean process
+            if (find_in_threads_list(2, pool_frida, gum_js_loop) > 0) {
+                DLOGD("found frida-specific thread");
+                dpt_crash();
+            }
+            if (find_in_threads_list(4, pool_frida, gmain, gbus, gum_js_loop) >= 2) {
+                DLOGD("found frida threads");
+                dpt_crash();
+            }
+        }
+
+        // Short randomized interval [1, 2) seconds
+        uint32_t delay = 1 + dpt_next_rand() % 2;
+        sleep(delay);
+    }
+}
+
 DPT_ENCRYPT void detectRisk() {
-    pthread_t t;
-    pthread_create(&t, nullptr, detectRiskOnThread, nullptr);
+    pthread_t t_fast, t_slow;
+    pthread_create(&t_fast, nullptr, detectRiskFast, nullptr);
+    pthread_create(&t_slow, nullptr, detectRiskOnThread, nullptr);
 }
 
 DPT_ENCRYPT void verifyAppSignature(JNIEnv *env, jobject context, const char *expectedSha256) {
