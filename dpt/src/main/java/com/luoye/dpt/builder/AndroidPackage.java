@@ -21,6 +21,7 @@ import com.luoye.dpt.util.IoUtils;
 import com.luoye.dpt.util.KeyUtils;
 import com.luoye.dpt.util.LogUtils;
 import com.luoye.dpt.util.MultiDexCodeUtils;
+import com.luoye.dpt.util.SoKeyUtils;
 import com.luoye.dpt.util.StringUtils;
 import com.luoye.dpt.util.ZipUtils;
 
@@ -585,7 +586,7 @@ public abstract class AndroidPackage {
                     continue;
                 }
                 encryptSoFile(soFile, rc4Key);
-                writeSoFileCryptKey(soFile, rc4Key);
+                SoKeyUtils.writeKey(soFile, rc4Key);
             }
         }
 
@@ -612,30 +613,6 @@ public abstract class AndroidPackage {
                     IoUtils.writeFile(soFile.getAbsolutePath(),enc,sectionHeader.getOffset());
                 }
             }
-        }
-        catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void writeSoFileCryptKey(File soFile, byte[] rc4key) {
-        try (ReadElf readElf = new ReadElf(soFile)) {
-            ReadElf.Symbol symbol = readElf.getDynamicSymbol(Const.RC4_KEY_SYMBOL);
-            if(symbol == null) {
-                LogUtils.warn("cannot find symbol in %s, no need write key", soFile.getName());
-                return;
-            }
-            else {
-                LogUtils.info("find symbol(%s) in %s", HexUtils.toHexString(symbol.value), soFile.getName());
-            }
-            long value = symbol.value;
-            int shndx = symbol.shndx;
-            List<ReadElf.SectionHeader> sectionHeaders = readElf.getSectionHeaders();
-            ReadElf.SectionHeader sectionHeader = sectionHeaders.get(shndx);
-            long symbolDataOffset = sectionHeader.getOffset() + value - sectionHeader.getAddr();
-            LogUtils.info("write symbol data to %s(%s)", soFile.getName(), HexUtils.toHexString(symbolDataOffset));
-
-            IoUtils.writeFile(soFile.getAbsolutePath(),rc4key,symbolDataOffset);
         }
         catch (Exception e) {
             e.printStackTrace();
@@ -706,7 +683,11 @@ public abstract class AndroidPackage {
                 try {
                     DexUtils.injectInvokeMethod(dexFile.getAbsolutePath(),
                             injectedDexFile.getAbsolutePath(),
-                            shellConfig.getJniClassNameSig()
+                            shellConfig.getJniClassNameSig(),
+                            // Keep-in-place (Compose) classes stay in the main dex and may load
+                            // before the shell is ready, so never inject the reflective call
+                            // that resolves JniBridge into them.
+                            isKeepClasses() ? DexUtils::isKeepInPlace : null
                     );
 
                     dexFile.delete();
@@ -717,13 +698,7 @@ public abstract class AndroidPackage {
                     injectedDexFile.delete();
                 }
 
-                if(isKeepClasses() && DexUtils.dexContainsKeepInPlace(dexFile)) {
-                    // Skip split entirely for dexes containing keep-in-place classes (e.g. Compose):
-                    // the re-partition would break Compose's cross-dex interface linking and cause IncompatibleClassChangeError.
-                    // The dex still goes through extractAllMethods (rule-matched classes are skipped as usual); it is just not split.
-                    LogUtils.info("Skip split for dex with keep-in-place classes (e.g. Compose): %s", dexFile.getName());
-                }
-                else if(isKeepClasses()) {
+                if(isKeepClasses()) {
                     File keepDex = new File(getKeepDexTempDir(packageDir).getAbsolutePath() + File.separator + dexFile.getName());
                     File splitDex = new File(dexFile.getAbsolutePath() + "_split.dex");
 
